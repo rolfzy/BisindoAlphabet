@@ -56,6 +56,7 @@ data class TfliteContainer(val interpreter: Interpreter, val gpuDelegate: GpuDel
 @OptIn(ExperimentalPermissionsApi::class)
 @Composable
 fun LiveDetection() {
+
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val cameraPermissionState = rememberPermissionState(android.Manifest.permission.CAMERA)
@@ -309,7 +310,6 @@ private fun runInference(
     Log.d("OutputTensorInfo", "Output shape: ${outputShape.contentToString()}")
     Log.d("OutputTensorInfo", "Output data type: $outputDataType")
 
-    // Buat buffer output berdasarkan tipe data
     val outputBuffer = when (outputDataType) {
         DataType.FLOAT32 -> {
             val numPredictions = outputShape[2] // 8400
@@ -335,7 +335,6 @@ private fun runInference(
         return emptyList()
     }
 
-    // Proses output berdasarkan tipe data
     return when (outputDataType) {
         DataType.FLOAT32 -> {
             @Suppress("UNCHECKED_CAST")
@@ -424,4 +423,6 @@ private fun setupTflite(context: Context): TfliteContainer {
 
     }
     return TfliteContainer(interpreter, gpuDelegate)
+
 }
+
