@@ -14,6 +14,8 @@ import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Card
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -29,6 +31,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
@@ -44,6 +49,7 @@ import org.tensorflow.lite.support.image.ImageProcessor
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.image.ops.ResizeOp
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class TfliteContainer(val interpreter: Interpreter, val gpuDelegate: GpuDelegate?)
 
@@ -56,16 +62,21 @@ fun LiveDetection() {
 
     var detectionBoxes by remember { mutableStateOf(emptyList<DetectionBox>()) }
     var inferenceTime by remember { mutableStateOf(0L) }
-    var imageSize by remember { mutableStateOf(Size(0, 0)) }
+    var fps by remember { mutableStateOf(0f) }
 
-    // PERBAIKAN 1: Inisialisasi TFLite menggunakan '=' bukan 'by'
+    var imageSize by remember { mutableStateOf(Size(0, 0)) }
+    var isProcessing by remember { mutableStateOf(false) }
+
     val tflite = remember { setupTflite(context) }
     val classNames = remember {
         FileUtil.loadLabels(
             context,
             Constant.LABELS_PATH
         )
-    } // PERBAIKAN 2: Nama konstanta
+    }
+
+    var frameCount by remember { mutableStateOf(0) }
+    var lastFpsTime by remember { mutableStateOf(System.currentTimeMillis()) }
 
     DisposableEffect(Unit) {
         onDispose {
@@ -88,6 +99,16 @@ fun LiveDetection() {
 
                     detectionBoxes = results
                     inferenceTime = endTime - startTime
+
+                    frameCount++
+                    val currentTime = System.currentTimeMillis()
+                    if (currentTime - lastFpsTime >= 1000) {
+                        fps = frameCount * 1000f / (currentTime - lastFpsTime)
+                        frameCount = 0
+                        lastFpsTime = currentTime
+                    }
+                    isProcessing = false
+
                 },
                 lifecycleOwner = lifecycleOwner,
                 context = context
@@ -99,11 +120,21 @@ fun LiveDetection() {
                 sourceImageHeight = imageSize.height
             )
 
-            Text(
-                text = "Time: $inferenceTime ms",
-                color = Color.White,
-                modifier = Modifier.align(Alignment.TopCenter)
-            )
+            Card(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(16.dp)
+            ){
+                Text(
+                    text = "FPS: ${"%.1f".format(fps)}\nInference: ${inferenceTime}ms\nDetections: ${detectionBoxes.size}",
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(8.dp)
+                )
+            }
+
+
         } else {
             LaunchedEffect(Unit) {
                 cameraPermissionState.launchPermissionRequest()
@@ -120,6 +151,7 @@ fun CameraView(
     context: Context
 ) {
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
+    val isProcessing = remember { AtomicBoolean(false) }
 
     AndroidView(
         factory = { ctx ->
@@ -135,7 +167,7 @@ fun CameraView(
             cameraProviderFuture.addListener({
                 val cameraProvider = cameraProviderFuture.get()
 
-                // PERBAIKAN 3: Bangun Preview terlebih dahulu, baru set SurfaceProvider
+
                 val preview = Preview.Builder()
                     .build()
                     .also {
@@ -143,41 +175,48 @@ fun CameraView(
                     }
 
                 val imageAnalyzer = ImageAnalysis.Builder()
-                    .setTargetResolution(Size(640, 640)) // Sesuai input model
+                    .setTargetResolution(Size(640, 640))
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
                     .also {
                         it.setAnalyzer(cameraExecutor) { imageProxy ->
-                            val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-                            val bitmap = imageProxy.toBitmap()
 
-                            val rotatedBitmap = if (rotationDegrees != 0) {
-                                val matrix =
-                                    Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-                                Bitmap.createBitmap(
-                                    bitmap,
-                                    0,
-                                    0,
-                                    bitmap.width,
-                                    bitmap.height,
-                                    matrix,
-                                    true
-                                )
-                            } else {
-                                bitmap
+                            if(isProcessing.compareAndSet(false,true)) {
+                                try {
+                                    val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+                                    val bitmap = imageProxy.toBitmap()
+                                    val rotatedBitmap = if (rotationDegrees != 0) {
+                                        val matrix =
+                                            Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+                                        Bitmap.createBitmap(
+                                            bitmap,
+                                            0,
+                                            0,
+                                            bitmap.width,
+                                            bitmap.height,
+                                            matrix,
+                                            true
+                                        )
+                                    } else {
+                                        bitmap
+                                    }
+                                    onBitmapReady(rotatedBitmap)
+                                } finally {
+                                    isProcessing.set(false)
+                                    imageProxy.close()
+                                }
+                            }else{
+                                imageProxy.close()
                             }
-                            onBitmapReady(rotatedBitmap)
-                            imageProxy.close()
                         }
                     }
 
                 try {
                     cameraProvider.unbindAll()
-                    // PERBAIKAN 4: bindToLifecycle sekarang menerima argumen yang benar
                     cameraProvider.bindToLifecycle(
                         lifecycleOwner,
                         CameraSelector.DEFAULT_BACK_CAMERA,
-                        preview, // Kirim objek Preview, bukan builder
+                        preview,
                         imageAnalyzer
                     )
                 } catch (e: Exception) {
@@ -194,14 +233,11 @@ fun DetectionOverlay(boxes: List<DetectionBox>, sourceImageWidth: Int, sourceIma
     Canvas(modifier = Modifier.fillMaxSize()) {
         if (sourceImageWidth == 0 || sourceImageHeight == 0) return@Canvas
 
-        // PERBAIKAN 5: Logika skala yang benar
         val scaleX = size.width / sourceImageWidth
         val scaleY = size.height / sourceImageHeight
 
         boxes.forEach { box ->
             val rect = box.boundingBox
-            // Koordinat BBox sudah diskalakan ke ukuran bitmap oleh YoloPostProcessor,
-            // sekarang kita hanya perlu menskalakannya ke ukuran canvas.
             val left = rect.left * scaleX
             val top = rect.top * scaleY
             val right = rect.right * scaleX
@@ -211,29 +247,19 @@ fun DetectionOverlay(boxes: List<DetectionBox>, sourceImageWidth: Int, sourceIma
                 color = Color.Red,
                 topLeft = Offset(left, top),
                 size = androidx.compose.ui.geometry.Size(right - left, bottom - top),
-                style = Stroke(width = 4f)
+                style = Stroke(width = 3f)
+            )
+
+            drawRect(
+                color = Color.Red,
+                topLeft = Offset(left,top - 30f),
+                size = androidx.compose.ui.geometry.Size(
+                    (box.classname.length * 12f).coerceAtLeast(80f),
+                    25f
+                )
             )
         }
     }
-}
-
-private fun setupTflite(context: Context): TfliteContainer {
-    val modelBuffer = FileUtil.loadMappedFile(context, Constant.MODEL_PATH)
-    var gpuDelegate: GpuDelegate?
-    // PERBAIKAN 6: Deklarasikan 'interpreter' dengan 'val'
-    var interpreter: Interpreter
-
-    try {
-        gpuDelegate = GpuDelegate()
-        val options = Interpreter.Options().addDelegate(gpuDelegate)
-        interpreter = Interpreter(modelBuffer, options)
-        Log.i("TFLiteSetup", "GPU delegate enabled.")
-    } catch (e: Exception) {
-        gpuDelegate = null
-        interpreter = Interpreter(modelBuffer) // Fallback to CPU
-        Log.e("TFLiteSetup", "GPU Delegate failed to initialize, falling back to CPU.", e)
-    }
-    return TfliteContainer(interpreter, gpuDelegate)
 }
 private fun runInference(
     bitmap: Bitmap,
@@ -244,9 +270,25 @@ private fun runInference(
     val modelInputWidth = 640
     val modelInputHeight = 640
 
-    // ================== PERBAIKAN 1: KEMBALI MENGGUNAKAN UINT8 ==================
-    // TensorImage HANYA menerima UINT8 atau FLOAT32. Kita gunakan UINT8 untuk model kuantisasi.
-    val tensorImage = TensorImage(org.tensorflow.lite.DataType.UINT8)
+    // PERBAIKAN UTAMA: Periksa format input tensor yang diharapkan model
+    val inputTensor = interpreter.getInputTensor(0)
+    val inputShape = inputTensor.shape()
+    val inputDataType = inputTensor.dataType()
+
+    Log.d("TensorInfo", "Input shape: ${inputShape.contentToString()}")
+    Log.d("TensorInfo", "Input data type: $inputDataType")
+    Log.d("TensorInfo", "Expected bytes: ${inputTensor.numBytes()}")
+
+    // Gunakan TensorImage dengan data type yang sesuai dengan model
+    val tensorImage = when (inputDataType) {
+        DataType.FLOAT32 -> TensorImage(DataType.FLOAT32)
+        DataType.UINT8 -> TensorImage(DataType.UINT8)
+        else -> {
+            Log.e("TensorError", "Unsupported input data type: $inputDataType")
+            TensorImage(DataType.FLOAT32) // fallback
+        }
+    }
+
     tensorImage.load(bitmap)
 
     val imageProcessor = ImageProcessor.Builder()
@@ -255,46 +297,131 @@ private fun runInference(
 
     val processedImage = imageProcessor.process(tensorImage)
     val inputBuffer = processedImage.buffer
-    // =========================================================================
+
+    // Log ukuran buffer untuk debugging
+    Log.d("BufferInfo", "Input buffer size: ${inputBuffer.remaining()} bytes")
 
     // Dapatkan detail tensor output
     val outputTensor = interpreter.getOutputTensor(0)
     val outputShape = outputTensor.shape()
-    val numPredictions = outputShape[2] // 8400
-    val numAttributes = outputShape[1] // 30
+    val outputDataType = outputTensor.dataType()
 
-    // Buat buffer output untuk menerima data mentah INT8
-    val rawOutputBuffer = Array(1) { Array(numAttributes) { ByteArray(numPredictions) } }
+    Log.d("OutputTensorInfo", "Output shape: ${outputShape.contentToString()}")
+    Log.d("OutputTensorInfo", "Output data type: $outputDataType")
 
-    // Jalankan inferensi
-    interpreter.run(inputBuffer, rawOutputBuffer)
+    // Buat buffer output berdasarkan tipe data
+    val outputBuffer = when (outputDataType) {
+        DataType.FLOAT32 -> {
+            val numPredictions = outputShape[2] // 8400
+            val numAttributes = outputShape[1] // 30
+            Array(1) { Array(numAttributes) { FloatArray(numPredictions) } }
+        }
+        DataType.UINT8 -> {
+            val numPredictions = outputShape[2] // 8400
+            val numAttributes = outputShape[1] // 30
+            Array(1) { Array(numAttributes) { ByteArray(numPredictions) } }
+        }
+        else -> {
+            Log.e("TensorError", "Unsupported output data type: $outputDataType")
+            return emptyList()
+        }
+    }
 
-    // De-kuantisasi dan Transpose
+    try {
+        // Jalankan inferensi
+        interpreter.run(inputBuffer, outputBuffer)
+    } catch (e: Exception) {
+        Log.e("InferenceError", "Error during inference", e)
+        return emptyList()
+    }
+
+    // Proses output berdasarkan tipe data
+    return when (outputDataType) {
+        DataType.FLOAT32 -> {
+            @Suppress("UNCHECKED_CAST")
+            val floatOutput = outputBuffer as Array<Array<FloatArray>>
+            processFloat32Output(floatOutput, classNames, bitmap.width, bitmap.height)
+        }
+        DataType.UINT8 -> {
+            @Suppress("UNCHECKED_CAST")
+            val byteOutput = outputBuffer as Array<Array<ByteArray>>
+            processUint8Output(byteOutput, outputTensor, classNames, bitmap.width, bitmap.height)
+        }
+        else -> emptyList()
+    }
+}
+
+private fun processFloat32Output(
+    outputBuffer: Array<Array<FloatArray>>,
+    classNames: List<String>,
+    imageWidth: Int,
+    imageHeight: Int
+): List<DetectionBox> {
+    val numPredictions = outputBuffer[0][0].size // 8400
+    val numAttributes = outputBuffer[0].size // 30
+    val transposedOutput = Array(1) { Array(numPredictions) { FloatArray(numAttributes) } }
+
+    for (i in 0 until numPredictions) {
+        for (j in 0 until numAttributes) {
+            transposedOutput[0][i][j] = outputBuffer[0][j][i]
+        }
+    }
+
+    return YoloPostProcessor.process(transposedOutput, classNames, imageWidth, imageHeight)
+}
+
+private fun processUint8Output(
+    rawOutputBuffer: Array<Array<ByteArray>>,
+    outputTensor: org.tensorflow.lite.Tensor,
+    classNames: List<String>,
+    imageWidth: Int,
+    imageHeight: Int
+): List<DetectionBox> {
+    val numPredictions = rawOutputBuffer[0][0].size // 8400
+    val numAttributes = rawOutputBuffer[0].size // 30
+
+    // De-kuantisasi
     val quantizationParams = outputTensor.quantizationParams()
     val scale = quantizationParams.scale
     val zeroPoint = quantizationParams.zeroPoint
 
     val dequantizedOutput = Array(1) { Array(numPredictions) { FloatArray(numAttributes) } }
 
-    // ================== PERBAIKAN 2: PASTIKAN LOOP INI BENAR ==================
-    // Ini adalah sumber error 'ArrayIndexOutOfBoundsException'.
-    // Pastikan Anda menggunakan 'until' yang berarti "berjalan sampai SEBELUM".
-
-    // 'i' berjalan dari 0 sampai 8399 (total 8400 kali)
     for (i in 0 until numPredictions) {
-        // 'j' berjalan dari 0 sampai 29 (total 30 kali)
-        for (j in 0 until numAttributes) { // PASTIKAN KATA 'until'
-
+        for (j in 0 until numAttributes) {
             val intVal = rawOutputBuffer[0][j][i].toInt() and 0xFF
             val floatVal = scale * (intVal - zeroPoint)
             dequantizedOutput[0][i][j] = floatVal
         }
     }
 
-    return YoloPostProcessor.process(
-        dequantizedOutput,
-        classNames,
-        bitmap.width,
-        bitmap.height
-    )
+    return YoloPostProcessor.process(dequantizedOutput, classNames, imageWidth, imageHeight)
+}
+
+
+private fun setupTflite(context: Context): TfliteContainer {
+    val modelBuffer = FileUtil.loadMappedFile(context, Constant.MODEL_PATH)
+    var gpuDelegate: GpuDelegate? = null
+    var interpreter: Interpreter
+
+    try {
+        gpuDelegate = GpuDelegate()
+        val options = Interpreter.Options().apply {
+            addDelegate(gpuDelegate)
+            setNumThreads(4)
+        }
+        interpreter = Interpreter(modelBuffer, options)
+        Log.i("TFLiteSetup", "GPU delegate enabled with 4 threads.")
+    } catch (e: Exception) {
+        gpuDelegate?.close()
+        gpuDelegate = null
+        val options  = Interpreter.Options().apply {
+            setNumThreads(4)
+            setUseNNAPI(true)
+        }
+        interpreter = Interpreter(modelBuffer)
+        Log.i("TFLiteSetup", "CPU mode with NNAPI enabled.")
+
+    }
+    return TfliteContainer(interpreter, gpuDelegate)
 }
